@@ -62,24 +62,28 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 测试
 
+测试是 **`unittest`**（不是 pytest），唯一的测试文件 `tests/test_manifest_real_adb.py`
+是**真机端到端**冒烟测试：冷启动 app → 走 card 的 entry/invocation → 等回复稳定 →
+滚动收全文。
+
 ```bash
-# 全量（无设备时真机测试自动 skip，suite 仍绿）
-uv run pytest
+# 设备无关的 discovery（没真机时整个 class 被 skip，suite 仍绿）
+python -m unittest discover -s tests -v
 
-# 只跑真机冒烟测试（需要连着 USB 调试的 Android 机 + adb 在 PATH）
-uv run pytest tests/test_manifest_real_adb.py -v
+# 单条测试（method 全名）
+python -m unittest tests.test_manifest_real_adb.ManifestRealAdbTests.test_com_aliyun_tongyi_chat_on_device -v
 
-# 单条测试
-uv run pytest tests/test_manifest_real_adb.py::TestManifestRealAdb::test_all_manifests_load -v
-
-# 一键把所有 card 的所有 capability 冒烟跑一遍（真机）
+# 一键把所有 card 的所有 capability 冒烟跑一遍（经 scripts/run_test.py，需真机）
 bash scripts/run_all_caps.sh
 ```
 
-- `tests/test_manifest_real_adb.py` 用 `adb devices` 探测设备，**没设备时整个 class 被
-  `pytest.mark.skipif` 跳过** —— 这是设计，不是失败。它会加载所有 `manifests/*.yaml`
-  确保 card 能反序列化（schema 校验 + `Card.app_name` 非空）。
-- `pyproject.toml` 配了 `testpaths=["tests"]`、`pythonpath=["."]`，所以 `agents` 包能直接 import。
+- **真机测试默认关**：class 上有 `@skipUnless(RUN_REAL_ADB_TESTS)`，要跑得在
+  `tests/config_local.py`（gitignore）写 `RUN_REAL_ADB_TESTS = True`；即便开了，
+  `setUpClass` 仍会在 `adb` 不存在或没连设备时 `SkipTest`。需要 `com.android.adbkeyboard/.AdbIME`。
+- 旋钮都在 `tests/config.py`（超时、稳定判定、`CAPTURE_TRAJ` 截图/XML、`SCREEN_RECORD`
+  录屏），可被 `config_local.py` 覆写。产物落 `test-results/`（gitignore）。
+- 这套真机测试**独立于** `agents/` adapter —— 它直接解析 card YAML 自己驱动 adb，
+  用来验证 manifest 的 entry/selector 在真机上仍然命中，不经过 MobileWorld / VLM。
 - 仓库没有配置 linter / formatter；不要凭空引入。
 
 ## 用户的 LLM 端点
