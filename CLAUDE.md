@@ -1,4 +1,43 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 # AppAgentCards — Claude 项目记忆
+
+## 这个项目是什么（架构总览）
+
+一句话：用一张声明式 **App Card**（YAML）描述某个 app 的「AI 协作能力」，然后通过
+[MobileWorld](https://github.com/Tongyi-MAI/MobileWorld) 在**真机**上把这些能力跑起来。
+一张 card = 一个 app 的「这个内置助手能干啥 + 每个能力怎么触发」。
+
+数据/控制流（自然语言 → 真机操作）：
+
+```
+自然语言 ─▶ capability_router ─▶ action_planner ─▶ appcards_agent ─▶ MobileWorld ─▶ 设备
+              │（选 capability）   │（展开成步骤）     │（tap/type/wait）
+            card_loader 读 + 校验 YAML card
+```
+
+各模块职责（都在 `agents/`，big-picture 看这五个文件就够）：
+
+| 文件 | 职责 |
+| --- | --- |
+| `card_loader.py` | 读 `manifests/*.yaml`，按 `spec/schema.json` 校验，反序列化成 `Card` / `Capability` / `EmbeddedAgent` dataclass。`x_*` 扩展字段（`x_capture_full_reply` / `x_max_scrolls` / `x_max_wait_seconds` / `x_prepare_fresh_conversation`）在这里解析。 |
+| `capability_router.py` | 给定一张（或多张）card + 用户请求，挑 intent 最匹配的 capability。LLM 打分，失败回退到关键词重叠。 |
+| `action_planner.py` | `build_plan(...)`：把选中 capability 的 `flow` 展开成具体步骤序列，按需注入 `open_app` / fresh-conversation / `wait_for_reply` 等。见下面 §3.5、第 4 条。 |
+| `appcards_agent.py` | `AppCardsAgent`，MobileWorld 的 agent 适配器。`predict()` 是主入口，`_materialize()` 把每个 plan step 落成 MobileWorld action。grounding、wait_for_reply、reply scrape、权限弹窗 dismiss 都在这。**绝大多数「已修的坑」都在这个文件**。 |
+| `flow_runner.py` | 跨 app flow：读 `manifests/_flows/*.yaml`，逐 step 解析 card+capability，把上一步 handoff 的输出（如 `place_name`）喂进下一步。 |
+| `_adb.py` | 共享 adb helper：`cold_launch()`（force-stop + monkey LAUNCHER + settle）、`force_stop()`、`swipe_down(ratio)`。三个脚本入口 + adapter 的 open_app 分支共用同一实现，都认 `APPCARDS_ANDROID_SERIAL` 选设备。 |
+| `_recorder.py` | trajectory / 调用记录辅助。 |
+
+仓库其余部分：
+
+- `SPEC.md` —— App Card schema 逐字段说明 + 设计理由（`x_` 前缀 = 非标扩展字段）。
+- `spec/schema.json` —— JSON-Schema（draft 2020-12），测试用它校验所有 card。
+- `manifests/*.yaml` —— 每个 app 一张 card（通义千问 / 高德 / 淘宝 / 微信 / WPS / 小红书 / 携程）。
+- `manifests/_flows/*.yaml` —— 跨 app flow（`name` + `steps`，每个 step 有 `card` / `capability` / `intent` / `handoff`）。
+- `scripts/` —— 入口（见下「首选入口」）。
+- `tests/` —— pytest：schema 校验 + 真机 adb 冒烟测试。
 
 ## Python 环境
 
@@ -21,9 +60,31 @@
   `pyproject.toml` 里写了 `"pydantic<2.11"`，当前锁在 `pydantic==2.10.6` /
   `pydantic-core==2.27.2`。如果未来升级 fastmcp 后这个限制可以放开。
 
+## 测试
+
+```bash
+# 全量（无设备时真机测试自动 skip，suite 仍绿）
+uv run pytest
+
+# 只跑真机冒烟测试（需要连着 USB 调试的 Android 机 + adb 在 PATH）
+uv run pytest tests/test_manifest_real_adb.py -v
+
+# 单条测试
+uv run pytest tests/test_manifest_real_adb.py::TestManifestRealAdb::test_all_manifests_load -v
+
+# 一键把所有 card 的所有 capability 冒烟跑一遍（真机）
+bash scripts/run_all_caps.sh
+```
+
+- `tests/test_manifest_real_adb.py` 用 `adb devices` 探测设备，**没设备时整个 class 被
+  `pytest.mark.skipif` 跳过** —— 这是设计，不是失败。它会加载所有 `manifests/*.yaml`
+  确保 card 能反序列化（schema 校验 + `Card.app_name` 非空）。
+- `pyproject.toml` 配了 `testpaths=["tests"]`、`pythonpath=["."]`，所以 `agents` 包能直接 import。
+- 仓库没有配置 linter / formatter；不要凭空引入。
+
 ## 用户的 LLM 端点
 
-具体值写在 `.env`（gitignore，**不要提交，也不要在回复里复述完整 key**）：
+具体值写在 `.env`（gitignore，**不要提交，也不要在回复里复述完整 key**），模板见 `.env.example`：
 
 | 变量 | 含义 |
 | --- | --- |
@@ -36,9 +97,9 @@ app、设 `APPCARDS_SKIP_OPEN_APP=1`，然后转发剩余 flag 给 `mw test`：
 
 ```bash
 uv run python scripts/run_test.py com.aliyun.tongyi "帮我点三杯蜜雪冰城蜜桃四季春"
-# 多 app NL 路由：
+# 多 app NL 路由（不传包名，从所有 card 里路由出最佳匹配再冷启动）：
 uv run python scripts/run_nl.py "在北京找三家独立书店，挑一家打车过去"
-# 多 app flow：
+# 多 app flow（跑 _flows/*.yaml，逐 step 链接 card）：
 uv run python scripts/run_flow.py manifests/_flows/xhs_to_amap_place.yaml --nl "..."
 ```
 
@@ -63,7 +124,7 @@ uv run mw test "帮我点三杯蜜雪冰城蜜桃四季春" \
 ## MobileWorld 依赖
 
 `mw` 来自外部仓库 [Tongyi-MAI/MobileWorld](https://github.com/Tongyi-MAI/MobileWorld)，已经通过
-`pyproject.toml` 的 `[tool.uv.sources]` 声明为 git 依赖（pin 到某个 commit）。
+`pyproject.toml` 的 `[tool.uv.sources]` 声明为 git 依赖（pin 到某个 commit/rev）。
 `uv sync` 会自动 clone+安装到 venv，不需要手动 `git clone`。
 
 ```bash
@@ -180,6 +241,17 @@ swipe。`agents/_adb.py:swipe_down(ratio=0.7)` 直接发 `input swipe`，幅度 
 - 调大（0.8–0.9）→ 砍 VLM poll 次数，但相邻帧重叠少，seam 处可能丢词。
 - 调小（0.4–0.5）→ 重叠多更稳，但 VLM 调用更多。
 - 方向：finger 从底往上推，把当前可见内容推出视口，露出**下方**的新内容（即向后读）。XHS 点点等场景下回复从上往下渲染，可见的是开头，后续内容在视口下方 — 所以 capture 阶段是顺序走读，chunks 直接按捕获顺序拼接，不再 `reversed()`。
+
+## 环境变量速查
+
+| 变量 | 作用 | 默认 |
+| --- | --- | --- |
+| `APPCARDS_TARGET_APP` | 目标 app 包名（直接走 `mw test` 时必填） | — |
+| `APPCARDS_SKIP_OPEN_APP` | 调用方已冷启动，planner 跳过 open_app | 脚本入口自动设 1 |
+| `APPCARDS_FRESH_CONV` | fresh-conversation 步是否注入 | 1（开） |
+| `APPCARDS_DISMISS_PERMISSIONS` | 自动 dismiss 权限弹窗 | 1（开） |
+| `APPCARDS_CAPTURE_SCROLL_RATIO` | capture_full scroll 幅度 | 0.7 |
+| `APPCARDS_ANDROID_SERIAL` | 多设备时选 adb serial | — |
 
 ## 已知阻塞
 
